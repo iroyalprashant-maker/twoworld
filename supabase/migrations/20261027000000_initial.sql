@@ -1,0 +1,25 @@
+-- Twofold initial schema. Apply with Supabase CLI or SQL editor.
+create extension if not exists pgcrypto;
+create table public.profiles (id uuid primary key references auth.users(id) on delete cascade, display_name text not null check(char_length(display_name) between 1 and 50), avatar jsonb not null default '{}'::jsonb, created_at timestamptz not null default now());
+create table public.worlds (id uuid primary key default gen_random_uuid(), name text not null check(char_length(name) between 1 and 50), theme text not null default 'rose' check(theme in ('rose','lilac','sage')), created_by uuid not null references auth.users(id), revision integer not null default 1, created_at timestamptz not null default now(), updated_at timestamptz not null default now());
+create table public.world_members (world_id uuid not null references public.worlds(id) on delete cascade, user_id uuid not null references auth.users(id) on delete cascade, role text not null check(role in ('owner','partner')), joined_at timestamptz not null default now(), primary key(world_id,user_id), unique(world_id,role));
+create table public.room_items (id uuid primary key default gen_random_uuid(), world_id uuid not null references public.worlds(id) on delete cascade, item_type text not null check(item_type in ('sofa','plant','lamp','record')), position jsonb not null default '{"x":0,"y":0}'::jsonb, color text, updated_by uuid not null references auth.users(id), updated_at timestamptz not null default now());
+create table public.invitations (id uuid primary key default gen_random_uuid(), world_id uuid not null references public.worlds(id) on delete cascade, token_hash text not null unique, expires_at timestamptz not null, accepted_at timestamptz, created_by uuid not null references auth.users(id), created_at timestamptz not null default now());
+create table public.messages (id uuid primary key default gen_random_uuid(), world_id uuid not null references public.worlds(id) on delete cascade, author_id uuid not null references auth.users(id), body text not null check(char_length(body) between 1 and 280), created_at timestamptz not null default now());
+create table public.memories (id uuid primary key default gen_random_uuid(), world_id uuid not null references public.worlds(id) on delete cascade, author_id uuid not null references auth.users(id), storage_path text not null, caption text check(char_length(caption) <= 280), created_at timestamptz not null default now());
+create or replace function public.is_world_member(target_world uuid) returns boolean language sql stable security definer set search_path=public as $$ select exists(select 1 from public.world_members where world_id=target_world and user_id=auth.uid()) $$;
+create or replace function public.limit_world_members() returns trigger language plpgsql security definer set search_path=public as $$ begin if (select count(*) from public.world_members where world_id=new.world_id) >= 2 then raise exception 'A world can have at most two active members'; end if; return new; end; $$;
+create trigger enforce_two_members before insert on public.world_members for each row execute function public.limit_world_members();
+alter table public.profiles enable row level security; alter table public.worlds enable row level security; alter table public.world_members enable row level security; alter table public.room_items enable row level security; alter table public.invitations enable row level security; alter table public.messages enable row level security; alter table public.memories enable row level security;
+create policy "profile own" on public.profiles for all using (id=auth.uid()) with check (id=auth.uid());
+create policy "members see worlds" on public.worlds for select using (public.is_world_member(id));
+create policy "members update worlds" on public.worlds for update using (public.is_world_member(id)) with check (public.is_world_member(id));
+create policy "members see memberships" on public.world_members for select using (public.is_world_member(world_id));
+create policy "members see items" on public.room_items for select using (public.is_world_member(world_id));
+create policy "members edit items" on public.room_items for all using (public.is_world_member(world_id)) with check (public.is_world_member(world_id) and updated_by=auth.uid());
+create policy "members read messages" on public.messages for select using (public.is_world_member(world_id));
+create policy "members send messages" on public.messages for insert with check (public.is_world_member(world_id) and author_id=auth.uid());
+create policy "members read memories" on public.memories for select using (public.is_world_member(world_id));
+create policy "members add memories" on public.memories for insert with check (public.is_world_member(world_id) and author_id=auth.uid());
+-- Invitations intentionally have no browser policy. Create/accept them only from server routes, storing a cryptographic token hash.
+-- Create a private `memories` bucket; issue signed URLs only after server-side membership verification.
